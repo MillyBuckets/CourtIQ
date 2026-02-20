@@ -1,16 +1,18 @@
 """
 CourtIQ — Fetch Season Stats Pipeline Script
 
-For each Tier 1 player, fetches season-by-season per-game averages
-from nba_api's PlayerCareerStats endpoint and upserts into the
-player_season_stats table.
+Fetches season-by-season per-game averages for Tier 1 players using the
+bulk LeagueDashPlayerStats endpoint and upserts into the player_season_stats table.
 
 Stores the current season + previous 3 seasons (4 total).
-Players with fewer than 4 seasons get however many they have.
+
+Approach: Uses bulk league-wide endpoint (one API call per season) instead
+of per-player calls. For 4 seasons that's only 4 API calls total vs ~600
+per-player calls — dramatically faster and more reliable.
 
 Data source:
-  - PlayerCareerStats (per_mode36='PerGame'): one call per player,
-    returns every season of their career in a single response.
+  - LeagueDashPlayerStats (per_mode_detailed='PerGame', measure_type='Base'):
+    one call per season, returns all ~500 players in a single response.
 """
 
 from __future__ import annotations
@@ -21,7 +23,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 import pandas as pd
-from nba_api.stats.endpoints import PlayerCareerStats
+from nba_api.stats.endpoints import LeagueDashPlayerStats
 
 sys.path.insert(0, sys.path[0])
 from config import (
@@ -72,34 +74,38 @@ def safe_int(value) -> Optional[int]:
 # ============================================================
 
 
-def get_tier1_players() -> list[dict]:
-    """Fetch all active Tier 1 players from Supabase."""
+def get_tier1_player_ids() -> set[int]:
+    """Fetch all active Tier 1 player IDs from Supabase."""
     result = (
         supabase.table("players")
-        .select("nba_player_id, full_name")
+        .select("nba_player_id")
         .eq("is_active", True)
         .eq("tier", 1)
         .execute()
     )
-    players = result.data
-    logger.info(f"Found {len(players)} active Tier 1 players in database")
-    return players
+    ids = {row["nba_player_id"] for row in result.data}
+    logger.info(f"Found {len(ids)} active Tier 1 players in database")
+    return ids
 
 
 @with_retry(max_retries=3, base_delay=10.0)
-def fetch_career_stats(player_id: int) -> pd.DataFrame:
+def fetch_league_stats_bulk(season: str) -> pd.DataFrame:
     """
-    Fetch career per-game stats for a single player.
-    Returns the SeasonTotalsRegularSeason DataFrame with one row per season.
+    Fetch LeagueDashPlayerStats with measure_type='Base' PerGame for ALL players.
+    Returns one row per player with per-game averages.
     """
+    logger.info(f"  Fetching LeagueDashPlayerStats (PerGame) for {season}...")
     rate_limit()
-    ep = PlayerCareerStats(
-        player_id=player_id,
-        per_mode36="PerGame",
+    ep = LeagueDashPlayerStats(
+        season=season,
+        season_type_all_star="Regular Season",
+        measure_type_detailed_defense="Base",
+        per_mode_detailed="PerGame",
         headers=CUSTOM_HEADERS,
         timeout=NBA_TIMEOUT,
     )
-    df = ep.get_data_frames()[0]  # SeasonTotalsRegularSeason
+    df = ep.get_data_frames()[0]
+    logger.info(f"    Returned {len(df)} players")
     return df
 
 
@@ -107,12 +113,9 @@ def fetch_career_stats(player_id: int) -> pd.DataFrame:
 # Data Transformation
 # ============================================================
 
-# Map nba_api column names -> our DB column names
-# PlayerCareerStats PerGame columns -> player_season_stats columns
+# Map LeagueDashPlayerStats columns -> our DB columns
 COLUMN_MAP = {
-    "SEASON_ID": "season",
     "GP": "gp",
-    "GS": "gs",
     "MIN": "min_pg",
     "PTS": "pts_pg",
     "REB": "reb_pg",
@@ -132,6 +135,7 @@ COLUMN_MAP = {
     "OREB": "oreb_pg",
     "DREB": "dreb_pg",
     "PF": "pf_pg",
+    "PLUS_MINUS": "plus_minus",
 }
 
 # Columns that are percentages (0-1 scale, stored as NUMERIC(5,3))
@@ -141,56 +145,50 @@ PCT_COLUMNS = {"fg_pct", "fg3_pct", "ft_pct"}
 INT_COLUMNS = {"gp", "gs"}
 
 
-def transform_season_row(
-    nba_player_id: int,
-    row: pd.Series,
-    now: str,
-) -> dict:
-    """Transform a single season row from nba_api format to our DB format."""
-    record = {
-        "nba_player_id": nba_player_id,
-        "season_type": "Regular Season",
-        "last_updated": now,
-    }
-
-    for nba_col, db_col in COLUMN_MAP.items():
-        value = row.get(nba_col)
-        if db_col == "season":
-            record[db_col] = str(value) if pd.notna(value) else None
-        elif db_col in INT_COLUMNS:
-            record[db_col] = safe_int(value)
-        elif db_col in PCT_COLUMNS:
-            record[db_col] = safe_float(value)
-        else:
-            record[db_col] = safe_float(value)
-
-    # PlayerCareerStats doesn't include plus_minus, set to None
-    record["plus_minus"] = None
-
-    return record
-
-
-def extract_player_seasons(
-    nba_player_id: int,
-    career_df: pd.DataFrame,
-    target_seasons: set[str],
+def build_season_records(
+    df: pd.DataFrame,
+    tier1_ids: set[int],
+    season: str,
     now: str,
 ) -> list[dict]:
     """
-    Filter a player's career DataFrame to target seasons and transform rows.
-    Returns list of records for upsert. Gracefully returns fewer than 4
-    seasons if the player hasn't been in the league that long.
+    Filter bulk DataFrame to Tier 1 players and build record dicts for upsert.
     """
-    if career_df.empty:
+    if df.empty:
+        return []
+
+    # Filter to Tier 1 players only
+    filtered = df[df["PLAYER_ID"].isin(tier1_ids)]
+
+    if filtered.empty:
         return []
 
     records = []
-    for _, row in career_df.iterrows():
-        season_id = str(row.get("SEASON_ID", ""))
-        if season_id in target_seasons:
-            record = transform_season_row(nba_player_id, row, now)
-            if record.get("season"):
-                records.append(record)
+    for _, row in filtered.iterrows():
+        record = {
+            "nba_player_id": int(row["PLAYER_ID"]),
+            "season": season,
+            "season_type": "Regular Season",
+            "last_updated": now,
+        }
+
+        for nba_col, db_col in COLUMN_MAP.items():
+            value = row.get(nba_col)
+            if db_col in INT_COLUMNS:
+                record[db_col] = safe_int(value)
+            elif db_col in PCT_COLUMNS:
+                record[db_col] = safe_float(value)
+            else:
+                record[db_col] = safe_float(value)
+
+        # GS (games started) — available from LeagueDashPlayerStats but not
+        # guaranteed across all seasons. Check if column exists.
+        if "GS" in row.index:
+            record["gs"] = safe_int(row.get("GS"))
+        else:
+            record["gs"] = None
+
+        records.append(record)
 
     return records
 
@@ -229,7 +227,6 @@ def upsert_season_stats(records: list[dict]) -> int:
 
 def main():
     target_seasons = get_seasons(NUM_SEASONS)
-    target_season_set = set(target_seasons)
     logger.info(
         f"=== fetch_season_stats.py — Seasons: {', '.join(target_seasons)} ==="
     )
@@ -237,46 +234,37 @@ def main():
     log_id = log_refresh_start(JOB_NAME)
 
     try:
-        # Step 1: Get Tier 1 players from DB
-        players = get_tier1_players()
-        if not players:
+        # Step 1: Get Tier 1 player IDs from DB
+        tier1_ids = get_tier1_player_ids()
+        if not tier1_ids:
             raise ValueError("No Tier 1 players found in database")
 
-        # Step 2: Fetch career stats for each player
         now = datetime.now(timezone.utc).isoformat()
         all_records: list[dict] = []
-        players_processed = 0
-        players_failed = 0
+        seasons_processed = 0
 
-        for i, player in enumerate(players):
-            player_id = player["nba_player_id"]
-            player_name = player["full_name"]
-
+        # Step 2: For each season, make 1 bulk API call
+        for season in target_seasons:
+            logger.info(f"--- Season {season} ---")
             try:
-                career_df = fetch_career_stats(player_id)
-                records = extract_player_seasons(
-                    player_id, career_df, target_season_set, now
-                )
-                all_records.extend(records)
-                players_processed += 1
+                df = fetch_league_stats_bulk(season)
 
-                if (i + 1) % 25 == 0 or (i + 1) == len(players):
-                    logger.info(
-                        f"  Progress: {i + 1}/{len(players)} players fetched "
-                        f"({len(all_records)} season records so far)"
-                    )
+                if df.empty:
+                    logger.warning(f"  No data for {season}, skipping")
+                    continue
+
+                records = build_season_records(df, tier1_ids, season, now)
+                logger.info(f"  Built {len(records)} Tier 1 records for {season}")
+                all_records.extend(records)
+                seasons_processed += 1
 
             except Exception as e:
-                players_failed += 1
-                logger.error(
-                    f"  Failed to fetch stats for {player_name} "
-                    f"(id={player_id}): {e}"
-                )
+                logger.error(f"  Failed to process season {season}: {e}")
                 continue
 
         logger.info(
-            f"Fetched {len(all_records)} season records from "
-            f"{players_processed} players ({players_failed} failed)"
+            f"Processed {seasons_processed}/{len(target_seasons)} seasons, "
+            f"{len(all_records)} total records"
         )
 
         # Step 3: Upsert all records
@@ -288,12 +276,13 @@ def main():
             logger.warning("No season stat records to upsert")
 
         # Step 4: Log success
-        log_refresh_complete(log_id, JOB_NAME, players_processed)
-        logger.info(f"=== fetch_season_stats.py complete ===")
+        players_updated = len({r["nba_player_id"] for r in all_records})
+        log_refresh_complete(log_id, JOB_NAME, players_updated)
+        logger.info("=== fetch_season_stats.py complete ===")
 
     except Exception as e:
         log_refresh_failed(log_id, JOB_NAME, traceback.format_exc())
-        logger.error(f"=== fetch_season_stats.py FAILED ===")
+        logger.error("=== fetch_season_stats.py FAILED ===")
         sys.exit(1)
 
 

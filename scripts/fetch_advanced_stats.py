@@ -124,7 +124,7 @@ def fetch_advanced_bulk(season: str) -> pd.DataFrame:
         season=season,
         season_type_all_star="Regular Season",
         measure_type_detailed_defense="Advanced",
-        per_mode_simple="PerGame",
+        per_mode_detailed="PerGame",
         headers=CUSTOM_HEADERS,
         timeout=NBA_TIMEOUT,
     )
@@ -145,7 +145,7 @@ def fetch_base_bulk(season: str) -> pd.DataFrame:
         season=season,
         season_type_all_star="Regular Season",
         measure_type_detailed_defense="Base",
-        per_mode_simple="PerGame",
+        per_mode_detailed="PerGame",
         headers=CUSTOM_HEADERS,
         timeout=NBA_TIMEOUT,
     )
