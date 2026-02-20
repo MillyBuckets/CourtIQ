@@ -1,0 +1,6 @@
+# CourtIQ — Allow all crawlers
+User-agent: *
+Allow: /
+
+# TODO: Uncomment once sitemap.xml is generated dynamically
+# Sitemap: https://courtiq.vercel.app/sitemap.xml

@@ -1,0 +1,4 @@
+nba_api>=1.4,<2.0
+pandas>=2.0,<3.0
+supabase>=2.0,<3.0
+python-dotenv>=1.0,<2.0

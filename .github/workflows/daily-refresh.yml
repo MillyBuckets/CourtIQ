@@ -1,0 +1,187 @@
+# ============================================================
+# CourtIQ — Daily Data Refresh Pipeline
+#
+# Runs every day at 11:00 UTC (6:00 AM Eastern) after all
+# West Coast games have finished. Updates all pipeline tables:
+# players → season stats → advanced stats → game logs → shot charts.
+#
+# Can also be triggered manually from the GitHub Actions UI.
+#
+# ============================================================
+# SETUP — GitHub Secrets Required
+#
+# Go to: GitHub repo → Settings → Secrets and variables → Actions
+# Add these two repository secrets:
+#
+#   SUPABASE_URL
+#     Your Supabase project URL.
+#     Find it: Supabase Dashboard → Project Settings → API → Project URL
+#     Example: https://abcdefghijkl.supabase.co
+#
+#   SUPABASE_SERVICE_KEY
+#     Your Supabase service_role key (NOT the anon key).
+#     The service role bypasses Row Level Security for pipeline writes.
+#     Find it: Supabase Dashboard → Project Settings → API → service_role
+#     ⚠️ Never expose this key in client-side code or commit it to git.
+#
+# ============================================================
+
+name: Daily Data Refresh
+
+on:
+  schedule:
+    # 11:00 UTC = 6:00 AM Eastern = 3:00 AM Pacific
+    # By this time all NBA games (including West Coast) have finished
+    # and box scores / shot data are fully posted on stats.nba.com.
+    - cron: '0 11 * * *'
+
+  workflow_dispatch:
+    # Manual trigger from GitHub Actions UI — useful for:
+    #   - First-time data population
+    #   - Re-running after a failure
+    #   - Backfilling a previous season's shot charts
+    inputs:
+      shot_chart_season:
+        description: >
+          Optional: also fetch shot charts for a specific prior season
+          (e.g. '2024-25'). Leave blank to only fetch current season.
+        required: false
+        default: ''
+
+# Prevent overlapping runs — if a previous daily run is still going,
+# cancel it in favor of the new one.
+concurrency:
+  group: daily-refresh
+  cancel-in-progress: true
+
+jobs:
+  pipeline:
+    runs-on: ubuntu-latest
+    # Total budget: ~90 min typical, 150 min worst case.
+    # Players ~5m + Season ~10m + Advanced ~10m + Game logs ~15m + Shots ~60m
+    timeout-minutes: 150
+
+    steps:
+      # ── Setup ─────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Cache pip dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ hashFiles('scripts/requirements.txt') }}
+          restore-keys: pip-
+
+      - name: Install dependencies
+        run: pip install -r scripts/requirements.txt
+
+      # ── Pipeline Steps ────────────────────────────────────
+      # Each step uses continue-on-error so that a failure in one
+      # script doesn't prevent the others from running. The summary
+      # step at the end reports the overall result.
+      #
+      # Order matters: fetch_players must run first (other scripts
+      # read from the players table), but the rest are independent
+      # of each other and just share rate-limit timing.
+
+      - name: 1. Fetch players
+        id: fetch_players
+        continue-on-error: true
+        run: python scripts/fetch_players.py
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+
+      - name: 2. Fetch season stats
+        id: fetch_season_stats
+        continue-on-error: true
+        run: python scripts/fetch_season_stats.py
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+
+      - name: 3. Fetch advanced stats
+        id: fetch_advanced_stats
+        continue-on-error: true
+        run: python scripts/fetch_advanced_stats.py
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+
+      - name: 4. Fetch game logs
+        id: fetch_game_logs
+        continue-on-error: true
+        run: python scripts/fetch_game_logs.py
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+
+      - name: 5. Fetch shot charts (current season)
+        id: fetch_shot_charts
+        continue-on-error: true
+        run: python scripts/fetch_shot_charts.py
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+
+      - name: 5b. Fetch shot charts (prior season backfill)
+        id: fetch_shot_charts_backfill
+        if: ${{ github.event.inputs.shot_chart_season != '' }}
+        continue-on-error: true
+        run: python scripts/fetch_shot_charts.py --season "${{ github.event.inputs.shot_chart_season }}"
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+
+      # ── Summary ───────────────────────────────────────────
+      # Collects the outcome of every step and prints a table.
+      # Fails the workflow if ANY step failed, so the Actions UI
+      # shows a red ✗ and email notifications fire.
+
+      - name: Pipeline summary
+        if: always()
+        run: |
+          echo "============================================"
+          echo "  CourtIQ Daily Refresh — Pipeline Summary"
+          echo "============================================"
+          echo ""
+
+          any_failed=false
+
+          report_step() {
+            local name="$1"
+            local outcome="$2"
+            if [ "$outcome" = "success" ]; then
+              echo "  ✅  $name"
+            elif [ "$outcome" = "failure" ]; then
+              echo "  ❌  $name"
+              any_failed=true
+            elif [ "$outcome" = "skipped" ]; then
+              echo "  ⏭️  $name (skipped)"
+            else
+              echo "  ⚠️  $name ($outcome)"
+            fi
+          }
+
+          report_step "Fetch players"                "${{ steps.fetch_players.outcome }}"
+          report_step "Fetch season stats"            "${{ steps.fetch_season_stats.outcome }}"
+          report_step "Fetch advanced stats"          "${{ steps.fetch_advanced_stats.outcome }}"
+          report_step "Fetch game logs"               "${{ steps.fetch_game_logs.outcome }}"
+          report_step "Fetch shot charts"             "${{ steps.fetch_shot_charts.outcome }}"
+          report_step "Shot charts backfill"          "${{ steps.fetch_shot_charts_backfill.outcome }}"
+
+          echo ""
+          echo "============================================"
+
+          if [ "$any_failed" = true ]; then
+            echo "❌ One or more steps failed. Check logs above."
+            exit 1
+          else
+            echo "✅ All steps completed successfully."
+          fi

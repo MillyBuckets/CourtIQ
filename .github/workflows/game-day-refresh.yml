@@ -1,0 +1,167 @@
+# ============================================================
+# CourtIQ — Game Day Refresh (Live Updates)
+#
+# Runs every 30 minutes during NBA game hours to keep the
+# "Last 5 / Last 10 Games" data fresh on game nights.
+#
+# Schedule: 00:00–07:00 UTC = 7:00 PM – 2:00 AM Eastern
+#   - Early games tip off ~7:00 PM ET (00:00 UTC)
+#   - Late games end ~1:30 AM ET (06:30 UTC)
+#   - 07:00 UTC buffer ensures final box scores are captured
+#
+# Only runs game_logs and shot_charts (the two tables that
+# change during a live game night). Players, season stats,
+# and advanced stats only need daily updates.
+#
+# ============================================================
+# SETUP — Same GitHub Secrets as daily-refresh.yml
+#
+# Go to: GitHub repo → Settings → Secrets and variables → Actions
+# Required secrets:
+#
+#   SUPABASE_URL
+#     Your Supabase project URL.
+#     Find it: Supabase Dashboard → Project Settings → API → Project URL
+#     Example: https://abcdefghijkl.supabase.co
+#
+#   SUPABASE_SERVICE_KEY
+#     Your Supabase service_role key (NOT the anon key).
+#     The service role bypasses Row Level Security for pipeline writes.
+#     Find it: Supabase Dashboard → Project Settings → API → service_role
+#     ⚠️ Never expose this key in client-side code or commit it to git.
+#
+# ============================================================
+# COST NOTE — GitHub Actions Free Tier
+#
+# Free tier: 2,000 minutes/month for private repos (unlimited for public).
+# This workflow runs ~14 times/night × ~20 min = ~280 min/night.
+# Over a 30-day month with games most nights: ~6,000–8,000 min.
+#
+# Options to stay within budget:
+#   1. Make the repo public (unlimited minutes)
+#   2. Reduce frequency to every 60 min instead of 30 min
+#   3. Only enable on game days (disable via cron comment when off-season)
+#   4. Use a self-hosted runner
+#
+# To disable this workflow during off-season, comment out the cron
+# lines below or disable it in the GitHub Actions UI.
+# ============================================================
+
+name: Game Day Refresh
+
+on:
+  schedule:
+    # Every 30 minutes from 00:00–06:30 UTC (7 PM – 1:30 AM ET)
+    # These cover the full window when NBA games are in progress.
+    - cron: '0 0 * * *'
+    - cron: '30 0 * * *'
+    - cron: '0 1 * * *'
+    - cron: '30 1 * * *'
+    - cron: '0 2 * * *'
+    - cron: '30 2 * * *'
+    - cron: '0 3 * * *'
+    - cron: '30 3 * * *'
+    - cron: '0 4 * * *'
+    - cron: '30 4 * * *'
+    - cron: '0 5 * * *'
+    - cron: '30 5 * * *'
+    - cron: '0 6 * * *'
+    - cron: '30 6 * * *'
+    - cron: '0 7 * * *'
+
+  workflow_dispatch:
+    # Manual trigger for testing or catching up after a missed run
+
+# If a previous game-day run is still in progress, skip the new one
+# rather than cancelling — we don't want to lose partial progress
+# on shot chart upserts.
+concurrency:
+  group: game-day-refresh
+  cancel-in-progress: false
+
+jobs:
+  live-update:
+    runs-on: ubuntu-latest
+    # Game logs: ~15 min, Shot charts: ~45 min (with resume, much faster
+    # since most players' data already exists from the daily run —
+    # only new games get fetched).
+    timeout-minutes: 75
+
+    steps:
+      # ── Setup ─────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Cache pip dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ hashFiles('scripts/requirements.txt') }}
+          restore-keys: pip-
+
+      - name: Install dependencies
+        run: pip install -r scripts/requirements.txt
+
+      # ── Live Data Steps ───────────────────────────────────
+      # Game logs first (fast, ~15 min), then shot charts (slower).
+      # Both use resume/upsert so re-runs are safe and incremental.
+
+      - name: 1. Fetch game logs
+        id: fetch_game_logs
+        continue-on-error: true
+        run: python scripts/fetch_game_logs.py
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+
+      - name: 2. Fetch shot charts
+        id: fetch_shot_charts
+        continue-on-error: true
+        run: python scripts/fetch_shot_charts.py
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+
+      # ── Summary ───────────────────────────────────────────
+      - name: Pipeline summary
+        if: always()
+        run: |
+          echo "============================================"
+          echo "  CourtIQ Game Day Refresh — Summary"
+          echo "============================================"
+          echo ""
+
+          any_failed=false
+
+          report_step() {
+            local name="$1"
+            local outcome="$2"
+            if [ "$outcome" = "success" ]; then
+              echo "  ✅  $name"
+            elif [ "$outcome" = "failure" ]; then
+              echo "  ❌  $name"
+              any_failed=true
+            elif [ "$outcome" = "skipped" ]; then
+              echo "  ⏭️  $name (skipped)"
+            else
+              echo "  ⚠️  $name ($outcome)"
+            fi
+          }
+
+          report_step "Fetch game logs"    "${{ steps.fetch_game_logs.outcome }}"
+          report_step "Fetch shot charts"  "${{ steps.fetch_shot_charts.outcome }}"
+
+          echo ""
+          echo "============================================"
+
+          if [ "$any_failed" = true ]; then
+            echo "❌ One or more steps failed. Check logs above."
+            exit 1
+          else
+            echo "✅ All steps completed successfully."
+          fi

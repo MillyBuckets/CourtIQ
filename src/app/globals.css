@@ -1,26 +1,108 @@
 @import "tailwindcss";
 
-:root {
-  --background: #ffffff;
-  --foreground: #171717;
-}
+/* ============================================================
+   CourtIQ — Global Styles & Design System
+   Colors and typography from PRD Section 14
+   ============================================================ */
 
 @theme inline {
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
-}
+  /* Primary palette */
+  --color-court-primary: #1A1A2E;
+  --color-court-secondary: #16213E;
+  --color-court-accent: #E94560;
+  --color-court-accent-alt: #0F3460;
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
-  }
+  /* Heat map scale */
+  --color-heat-cold: #3B82F6;
+  --color-heat-neutral: #F8FAFC;
+  --color-heat-hot: #EF4444;
+
+  /* Text */
+  --color-text-primary: #F8FAFC;
+  --color-text-secondary: #94A3B8;
+  --color-text-stat: #E2E8F0;
+
+  /* Trend indicators */
+  --color-trend-up: #22C55E;
+  --color-trend-down: #EF4444;
+  --color-trend-neutral: #94A3B8;
+
+  /* Background */
+  --color-background: #1A1A2E;
+  --color-foreground: #F8FAFC;
+  --color-card: #16213E;
+
+  /* Typography */
+  --font-sans: var(--font-inter);
+  --font-mono: var(--font-jetbrains-mono);
 }
 
 body {
-  background: var(--background);
-  color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+  background: var(--color-background);
+  color: var(--color-foreground);
+  font-family: var(--font-sans), system-ui, sans-serif;
+}
+
+/* ============================================================
+   Animations
+   ============================================================ */
+
+/* Staggered card entrance: fade-in + slide-up */
+@keyframes card-enter {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.animate-card-enter {
+  animation: card-enter 250ms ease both;
+}
+
+/* Radar polygon grow-in from center */
+@keyframes radar-grow {
+  from {
+    opacity: 0;
+    transform: scale(0);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+.animate-radar-grow {
+  transform-origin: center;
+  animation: radar-grow 300ms ease-out both;
+}
+
+/* Apply grow animation to Recharts radar layers inside the wrapper */
+.radar-animate .recharts-radar-polygon {
+  transform-origin: center;
+  animation: radar-grow 300ms ease-out both;
+  animation-delay: 100ms;
+}
+
+.radar-animate .recharts-radar-dots {
+  animation: radar-grow 200ms ease-out both;
+  animation-delay: 250ms;
+  transform-origin: center;
+}
+
+/* Page content fade-in (prevents flash) */
+@keyframes page-fade-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+.animate-page-enter {
+  animation: page-fade-in 200ms ease both;
 }
